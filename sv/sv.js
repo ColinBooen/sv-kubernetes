@@ -232,6 +232,7 @@ scripts.start = function(args) {
 		`--set sv.env=${env}`,
 		`--set sv.applicationPath=${appFolder}`,
 		`--set sv.containerPath=${containerFolder}`,
+		`--set sv.canHostPort=true`,
 		`-f /sv/internal/sv.json`
 	);
 
