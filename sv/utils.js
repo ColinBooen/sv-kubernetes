@@ -4,8 +4,41 @@ const fs = require("fs");
 const lodash = require("lodash");
 const chalk = require("chalk");
 const js_yaml = require("js-yaml");
+const read = require('read');
+const util = require("util");
 
 const constants = require("./constants");
+const readP = util.promisify(read);
+
+/**
+ * Prompt the user for confirmation if running an action on a non-local environment to prevent mistakes
+ */
+async function confirmContextCommand(context, confirmActions = true, readOptions = {}) {
+	if (
+		confirmActions !== true
+		||
+		[constants.LOCAL_CONTEXT_DESKTOP, constants.LOCAL_CONTEXT_MINIKUBE].includes(context) === true
+	) {
+		return true;
+	}
+
+	let result;
+	try {
+		result = await readP(Object.assign({
+			prompt : "You are performing an action on a non-local cluster.\n[Enter] to continue or ctrl+c to cancel."
+		}, readOptions));
+	} catch(err) {
+		console.log(`\n${err.message}`);
+		return false;
+	}
+
+	if (result !== undefined && result.length !== 0) {
+		console.log("unexpected data");
+		return false;
+	}
+
+	return true;
+}
 
 function exec(command, options = {}) {
 	return execSync(command, { stdio : "inherit", ...options });
@@ -15,8 +48,15 @@ function execSilent(command, options = {}) {
 	return execSync(command, { ...options }).toString().trim();
 }
 
-function logContext() {
-	console.log(chalk.green(`[Current Context]: ${getCurrentContext()}`));
+async function logContext(confirmActions = process.env.BYPASS_SV_COMMAND_CONTROL !== "true") {
+	const currentContext = getCurrentContext();
+	console.log(chalk.green(`[Current Context]: ${currentContext}`));
+
+	// ensure we should proceed with the action if the context isn't on their local kube
+	const shouldContinue = await confirmContextCommand(currentContext, confirmActions);
+	if (!shouldContinue) {
+		process.exit(1);
+	}
 }
 
 function getCurrentContext() {
@@ -96,40 +136,49 @@ function getCurrentPodsV2(args = {}) {
 
 	// simplify the return for downstream functions
 	/** @type {import("./definitions").PodResult[]} */
-	let pods = originalPods.map(val => ({
-		name : val.metadata.name,
-		testCommand : val.metadata.annotations !== undefined && val.metadata.annotations["sv-test-command"] ? val.metadata.annotations["sv-test-command"] : undefined,
-		rootName : val.metadata.name.replace(/-[^\-]+-[^\-]+$/, ""),
-		nodeName: val.spec.nodeName,
-		namespace: val.metadata.namespace,
-		ip : val.status.podIP,
-		containers: val.spec.containers.map(val => {
-			const cpuRequest = lodash.get(val, "resources.requests.cpu");
-			const memoryRequest = lodash.get(val, "resources.requests.memory");
+	let pods = originalPods.map(val => {
+		const allStatuses = [
+			...(val.status.initContainerStatuses ?? []),
+			...(val.status.containerStatuses ?? [])
+		];
 
-			const resources = {
-				requests: {
-					cpu: cpuRequest !== undefined ? cpuRequest : "0",
-					memory: memoryRequest !== undefined ? memoryRequest : "0"
+		return {
+			name : val.metadata.name,
+			testCommand : val.metadata.annotations !== undefined && val.metadata.annotations["sv-test-command"] ? val.metadata.annotations["sv-test-command"] : undefined,
+			rootName : val.metadata.name.replace(/-[^\-]+-[^\-]+$/, ""),
+			nodeName: val.spec.nodeName,
+			namespace: val.metadata.namespace,
+			ip : val.status.podIP,
+			containers: val.spec.containers.map(val => {
+				const cpuRequest = lodash.get(val, "resources.requests.cpu");
+				const memoryRequest = lodash.get(val, "resources.requests.memory");
+
+				const resources = {
+					requests: {
+						cpu: cpuRequest !== undefined ? cpuRequest : "0",
+						memory: memoryRequest !== undefined ? memoryRequest : "0"
+					}
 				}
-			}
 
-			return {
-				name: val.name,
-				resources
-			}
-		}),
-		containerNames : [
-			...val.spec.containers.map(val => val.name),
-			...(val.spec.initContainers ?? []).map(val => val.name)
-		],
-		runningContainerNames: [
-			...getRunningContainers(val.status.containerStatuses ?? []),
-			...getRunningContainers(val.status.initContainerStatuses ?? [])
-		],
-		status : val.status.phase,
-		raw : val
-	}));
+				return {
+					name: val.name,
+					resources
+				}
+			}),
+			containerNames : [
+				...val.spec.containers.map(val => val.name),
+				...(val.spec.initContainers ?? []).map(val => val.name)
+			],
+			runningContainerNames: getRunningContainers(allStatuses),
+			errorContainerNames: allStatuses.filter(val => {
+				return val.ready === false && val.imageID !== ""
+			}).map(val => {
+				return val.name
+			}),
+			status : val.status.phase,
+			raw : val
+		}
+	});
 
 	// If we have want a specific name
 	if (args.name) {
@@ -197,6 +246,14 @@ function _isMinikubeEnv() {
 }
 const isMinikubeEnv = lodash.memoize(_isMinikubeEnv);
 
+function isDockerDesktopEnv() {
+	return constants.IS_DOCKER_DESKTOP;
+}
+
+function isArmEnv() {
+	return process.arch !== "x64";
+}
+
 function getDockerEnv() {
 	return isMinikubeEnv() ? {
 		...process.env,
@@ -204,14 +261,52 @@ function getDockerEnv() {
 	} : process.env;
 }
 
+async function getAuthTokenFromRefreshToken(refreshToken) {
+	const fetchResult = await fetch(constants.GRAPH_URL, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json"
+		},
+		body: JSON.stringify({
+			variables: {
+				token: refreshToken
+			},
+			query: `
+				query($token: String!) {
+					auth {
+						refresh_token(refresh_token: $token) {
+							success
+							message
+							token
+						}
+					}
+				}
+			`
+		})
+	});
+
+	const json = await fetchResult.json();
+	const result = json.data.auth.refresh_token;
+	if (!result.success) {
+		throw new Error(result.message);
+	}
+
+	return result.token;
+}
+
+module.exports.confirmContextCommand = confirmContextCommand;
 module.exports.deepMerge = deepMerge;
 module.exports.exec = exec;
 module.exports.execSilent = execSilent;
+module.exports.getAuthTokenFromRefreshToken = getAuthTokenFromRefreshToken;
 module.exports.getCurrentContext = getCurrentContext;
 module.exports.getCurrentPods = getCurrentPods;
 module.exports.getCurrentPodsV2 = getCurrentPodsV2;
 module.exports.getDockerEnv = getDockerEnv;
 module.exports.getMinikubeDockerEnv = getMinikubeDockerEnv;
+module.exports.isMinikubeEnv = isMinikubeEnv;
+module.exports.isDockerDesktopEnv = isDockerDesktopEnv;
+module.exports.isArmEnv = isArmEnv;
 module.exports.loadSettingsYaml = loadSettingsYaml;
 module.exports.loadYaml = loadYaml;
 module.exports.log = log;

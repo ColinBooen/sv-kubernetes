@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 //@ts-check
 
+if (process.getuid() !== 0) {
+	throw new Error("'sv' commands must be run as root");
+}
+
 const fs = require("fs");
 const { execSync, spawn, fork } = require("child_process");
 const read = require("read");
@@ -21,6 +25,9 @@ const {
 	logContext,
 	mapBuildArgs,
 	getDockerEnv,
+	isDockerDesktopEnv,
+	isArmEnv,
+	isMinikubeEnv
 } = require("./utils");
 
 const constants = require("./constants");
@@ -180,6 +187,9 @@ scripts.install = async function(args) {
 		}
 	}
 
+	// disables filemode by default when checking out since this is done in linux and conflicts when viewed from windows
+	execPath(`git config core.filemode false`);
+
 	if (type === "app" && !noDependencies) {
 		// if we are install an app, see if the app has dependencies and sv install those as well
 		const settings = loadSettingsYaml(name);
@@ -202,8 +212,8 @@ scripts.install = async function(args) {
 	}
 }
 
-scripts.start = function(args) {
-	logContext();
+scripts.start = async function(args) {
+	await logContext();
 
 	var myArgs = args.argv.slice();
 	var applicationName = myArgs.shift();
@@ -222,9 +232,14 @@ scripts.start = function(args) {
 
 	const commandArgs = [];
 	const deploymentName = flags.alias !== undefined ? flags.alias : applicationName;
+
+	const rootKubeFolder = constants.SV_KUBERNETES_MOUNT_PATH;
 	const appFolder = `/sv/applications/${applicationName}`;
 	const chartFolder = `${appFolder}/chart`;
 	const containerFolder = `${appFolder}/containers`;
+	const externalApplicationFolder = `${rootKubeFolder}/applications/${applicationName}`;
+	const externalContainerFolder = `${externalApplicationFolder}/containers`;
+	const rootContainersFolder = `${rootKubeFolder}/containers`;
 
 	commandArgs.push(
 		deploymentName,
@@ -232,14 +247,31 @@ scripts.start = function(args) {
 		`--install`,
 		`--set sv.deploymentName=${deploymentName}`,
 		`--set sv.env=${env}`,
-		`--set sv.applicationPath=${appFolder}`,
-		`--set sv.containerPath=${containerFolder}`,
+		`--set sv.applicationPath=${externalApplicationFolder}`,
+		`--set sv.containerPath=${externalContainerFolder}`,
+		`--set sv.rootContainerPath=${rootContainersFolder}`,
+		`--set sv.rootPath=${rootKubeFolder}`,
+		`--set sv.canHostPort=${isMinikubeEnv()}`,
+		`--set sv.isWsl=${isDockerDesktopEnv()}`,
+		`--set sv.isDockerDesktop=${isDockerDesktopEnv()}`,
+		`--set sv.isArm=${isArmEnv()}`,
+		`--set sv.isMinikube=${isMinikubeEnv()}`,
+		`--set sv.refreshToken=$(cat /sv/internal/refresh_token 2>/dev/null)`,
+		`--set sv.userInfo.email=$(cat /sv/internal/user_info.json 2>/dev/null | jq -r .email)`,
+		`--set sv.applicationGitSha=$(git -C ${appFolder} rev-parse HEAD 2>/dev/null)`,
+		`--set sv.applicationGitBranch=$(git -C ${appFolder} rev-parse --abbrev-ref HEAD 2>/dev/null)`,
+		`--set sv.applicationGitTag=$(git describe --tags 2>/dev/null)`,
 		`-f /sv/internal/sv.json`
 	);
 
-	var envFile = `${chartFolder}/values_${env}.yaml`;
+	const envFile = `${chartFolder}/values_${env}.yaml`;
 	if (fs.existsSync(envFile)) {
 		commandArgs.push(`-f ${envFile}`);
+	}
+
+	const overwriteFile = `${chartFolder}/values_overwrite.yaml`;
+	if (fs.existsSync(overwriteFile)) {
+		commandArgs.push(`-f ${overwriteFile}`);
 	}
 
 	const settings = loadSettingsYaml(applicationName);
@@ -269,6 +301,8 @@ scripts.start = function(args) {
 		}
 
 		const isDirectory = source => fs.lstatSync(containerFolder + '/' + source).isDirectory()
+
+		// Build application containers
 		const dirs =
 			settings[`buildOrder_${env}`] ||
 			settings.buildOrder ||
@@ -276,6 +310,12 @@ scripts.start = function(args) {
 		;
 
 		dirs.forEach(function(val, i) {
+			if (val.startsWith("external/")) {
+				const containerName = val.replace(/external\//, "");
+				exec(`sv build --name=${containerName} --env=${env}`);
+				return;
+			}
+
 			const myBuildArgs = [...buildArgs];
 			myBuildArgs.push(`--name ${val}`);
 
@@ -350,12 +390,38 @@ scripts.start = function(args) {
 	}
 }
 
-scripts.stop = function(args) {
-	logContext();
+scripts.stop = async function(args) {
+	await logContext();
 
-	var applicationName = args.argv[0];
+	const flags = commandLineArgs([
+		{ name: "name", defaultOption: true },
+		// if true, then it will exit code 0 even if the release name doesn't exit
+		{ name: "ignore-not-found", type: Boolean },
+		// if true, the command will not return until the app is fully undeployed
+		{ name: "wait", type: Boolean }
+	], { argv : args.argv, stopAtFirstUnknown : true });
 
-	exec(`helm delete ${applicationName} --purge`);
+	if (flags.name === undefined) {
+		throw new Error("Must specify application name");
+	}
+
+	const commandArgs = [flags.name];
+
+	if (flags["ignore-not-found"]) {
+		commandArgs.push("--ignore-not-found");
+	}
+
+	if (flags.wait) {
+		commandArgs.push("--wait");
+	}
+
+	// append flags we don't recognize to pass to upgrade
+	if (flags._unknown) {
+		commandArgs.push(...flags._unknown);
+	}
+
+	const commandArgString = commandArgs.join(" ");
+	exec(`helm uninstall ${commandArgString}`);
 }
 
 scripts.logs = function(args) {
@@ -435,7 +501,7 @@ scripts.switchContext = function (args) {
 			exec(`USE_GKE_GCLOUD_AUTH_PLUGIN=True gcloud container clusters get-credentials ${flags.cluster} --zone us-east1-b --project sv-${flags.project}-231700`);
 			exec(`kubectl config use-context ${getCurrentContext()}`);
 		} else {
-			exec(`kubectl config use-context minikube`);
+			exec(`kubectl config use-context docker-desktop`);
 		}
 	} catch(err) {
 		throw new Error(`Error Switching Contexts\nCluster: ${chalk.blue(flags.cluster)}\nProject: ${chalk.blue(flags.project)}`);
@@ -443,7 +509,7 @@ scripts.switchContext = function (args) {
 };
 
 scripts.getContext = function (args) {
-	logContext();
+	logContext(false);
 }
 
 scripts.listProjects = function() {
@@ -477,7 +543,12 @@ scripts.enterPod = function(args) {
 	// pick the best available shell, exec $shell replaces the initial /bin/sh with whatever shell it chooses to run
 	const cmd = `/bin/sh -c 'shell=$(which bash >/dev/null 2>&1 && echo "bash" || echo "sh"); exec $shell'`
 	console.log(`Entering Pod: ${pod.name}`);
-	exec(`kubectl exec -it ${pod.name} -c ${pod.containerNames[0]} -- ${cmd}`);
+	try {
+		exec(`kubectl exec -it ${pod.name} -c ${pod.containerNames[0]} -- ${cmd}`);
+	} catch(e) {
+		// blackholing error, since stderr, stdout streamed to console
+		// otherwise this throws if the last run command was a non-0 command
+	}
 }
 
 scripts.execPod = function(args) {
@@ -521,6 +592,24 @@ scripts.copyFrom = function(args) {
 	console.log(`Copy complete to ${pathTo}`);
 }
 
+scripts.copyTo = function(args) {
+	var flags = commandLineArgs([
+		// filter to only listen on a specific set of pods
+		{ name : "container", alias : "c", type : String },
+		{ name : "args", type : String, multiple : true, defaultOption : true }
+	], { argv : args.argv });
+
+	const podName = flags.args[0];
+	const pathFrom = flags.args[1];
+	const pathTo = flags.args[2];
+	const pod = getCurrentPods(podName)[0];
+
+	const containerString = flags.container !== undefined ? `-c ${flags.container}` : "";
+
+	execSilent(`kubectl cp ${containerString} "${pathFrom}" ${pod.name}:"${pathTo}"`);
+	console.log(`Copy complete to ${pod.name}:${pathTo}`);
+}
+
 scripts.script = function(args) {
 	const [applicationName, scriptName, ...flags] = args.argv;
 
@@ -557,8 +646,12 @@ scripts.script = function(args) {
 }
 
 scripts.restartPod = function(args) {
-	const podName = args.argv[0];
-	const pods = getCurrentPods(podName);
+	const flags = commandLineArgs([
+		{ name : "name", type : String, defaultOption: true },
+		{ name : "container", alias : "c", type : String },
+	], { argv : args.argv, stopAtFirstUnknown : true });
+
+	const pods = getCurrentPods(flags.name, flags.container);
 
 	if (pods.length > 1) {
 		throw new Error("Pod name returned more than 1 pod.");
@@ -600,7 +693,8 @@ scripts.editSecrets = function (args) {
 		throw new Error("You must have a 'secrets_key' variable in your settings.yaml.");
 	}
 
-	exec(`EDITOR=nano kubesec edit -if --key=${settings.secrets_key} ${secretsFile}`);
+	const default_editor = process.env.DEFAULT_EDITOR || 'nano';
+	exec(`EDITOR=${default_editor} kubesec edit -if --key=${settings.secrets_key} ${secretsFile}`);
 }
 
 scripts.debug = function(args) {
@@ -741,6 +835,6 @@ if (scripts[scriptName] === undefined) {
 	process.exit();
 }
 
-checkOutdated();
+// checkOutdated();
 
 scripts[scriptName]({ argv : argv });

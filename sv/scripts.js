@@ -3,6 +3,8 @@ const commandLineArgs = require("command-line-args");
 const js_yaml = require("js-yaml");
 const fs = require("fs");
 const lodash = require("lodash");
+const read = require("read");
+const util = require("util");
 
 const {
 	deepMerge,
@@ -14,10 +16,13 @@ const {
 	log,
 	validatePath,
 	getDockerEnv,
-	getCurrentPodsV2
+	getCurrentPodsV2,
+	getAuthTokenFromRefreshToken
 } = require("./utils");
 
 const constants = require("./constants");
+
+const readP = util.promisify(read);
 
 function build({ argv }) {
 	const flags = commandLineArgs([
@@ -189,7 +194,104 @@ function minikubeSystemPrune() {
 	});
 }
 
+function logFailed() {
+	const pods = getCurrentPodsV2();
+	for (const pod of pods) {
+		for (const container of pod.errorContainerNames) {
+			console.log(`---POD: ${pod.name} CONTAINER: ${container} ---`);
+			exec(`kubectl logs ${pod.name} -c ${container}`);
+		}
+	}
+}
+
+async function authLogin() {
+	const graphUrl = "https://graphql.simpleviewinc.com";
+	const headers = {
+		"Content-Type": "application/json"
+	}
+
+	console.log("Visit https://auth.simpleviewinc.com/ and log in. Once complete click on 'Refresh Token' and paste the value here.");
+	const refreshToken = await readP({ prompt: "Paste Refresh Token: " });
+
+	const token = await getAuthTokenFromRefreshToken(refreshToken);
+
+	const userFetch = await fetch(graphUrl, {
+		method: "POST",
+		headers: {
+			...headers,
+			Authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({
+			query: `
+				query {
+					auth {
+						current(acct_id: "sv-all") {
+							success
+							message
+							doc {
+								email
+								firstname
+								lastname
+								sv
+							}
+						}
+					}
+				}
+			`
+		})
+	});
+
+	const json = await userFetch.json();
+	const userResult = json.data.auth.current;
+	if (!userResult.success) {
+		throw new Error(userResult.message);
+	}
+
+	if (!userResult.doc.sv === true) {
+		throw new Error("User is not SV, unable to proceed.");
+	}
+
+	console.log("Logged in as: ", userResult.doc.email);
+	await fs.writeFileSync(constants.REFRESH_TOKEN_PATH, refreshToken);
+	await fs.writeFileSync("/sv/internal/auth_token", token);
+	await fs.writeFileSync("/sv/internal/user_info.json", JSON.stringify(userResult.doc));
+}
+
+async function authToken() {
+	if (!fs.existsSync(constants.REFRESH_TOKEN_PATH)) {
+		throw new Error("Must login with 'sv authLogin'.");
+	}
+
+	const token = await getAuthTokenFromRefreshToken(await fs.readFileSync(constants.REFRESH_TOKEN_PATH).toString());
+	await fs.writeFileSync(constants.AUTH_TOKEN_PATH, token);
+	console.log("Generated token: ");
+	console.log(token);
+}
+
+async function getSecretsGroups({ argv }) {
+	const flags = commandLineArgs([
+		{ name : "name", type : String, defaultOption: true }
+	], { argv });
+
+	const settings = loadSettingsYaml(flags.name);
+
+	if (settings.secrets_key === undefined) {
+		throw new Error(`App '${flags.name}' does not have a secrets group declared.`);
+	}
+
+	const { groups } = settings.secrets_key.match(/gcp:projects\/(?<project>.*?)\/locations\/(?<location>.*?)\/keyRings\/(?<keyring>.*?)\/cryptoKeys\/(?<name>.*)/);
+	if (!groups.project || !groups.location || !groups.keyring || !groups.name) {
+		throw new Error(`Failed to parse secrets_key: ${JSON.stringify(groups)}`);
+	}
+
+	exec(`gcloud kms keys get-iam-policy ${groups.name} --keyring=${groups.keyring} --location=${groups.location} --project=${groups.project}`);
+}
+
 module.exports.build = build;
 module.exports.minikubeSystemPrune = minikubeSystemPrune;
 module.exports.deleteEvicted = deleteEvicted;
 module.exports.topPods = topPods;
+module.exports.logFailed = logFailed;
+module.exports.authLogin = authLogin;
+module.exports.authToken = authToken;
+module.exports.getSecretsGroups = getSecretsGroups;
